@@ -4,40 +4,66 @@ env:
   variables:
     AWS_REGION_NAME: ap-northeast-2
     ECR_REPOSITORY_NAME: sbcntr-backend
-    ECS_CONTAINER_NAME: app
+    IMAGE_NAME: sbcntr-backend
     DOCKER_BUILDKIT: "1"
+    DOCKLE_HOST: "unix:///var/run/docker.sock"   # Dockle이 로컬 Docker 데몬을 보도록 지정
 
 phases:
   pre_build:
     commands:
-      - echo "===== Pre Build Start ====="
+      - echo "Get AWS account id..."
       - AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
+
+      - echo "Login to ECR..."
+      - aws ecr get-login-password --region ${AWS_REGION_NAME} | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION_NAME}.amazonaws.com
+
       - REPOSITORY_URI=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION_NAME}.amazonaws.com/${ECR_REPOSITORY_NAME}
-      - IMAGE_TAG=$(echo ${CODEBUILD_RESOLVED_SOURCE_VERSION} | cut -c 1-7)
+      - IMAGE_TAG=$(echo ${CODEBUILD_RESOLVED_SOURCE_VERSION} | head -c 7)
+      - LOCAL_IMAGE=${IMAGE_NAME}:${IMAGE_TAG}
+      - ECR_IMAGE=${REPOSITORY_URI}:${IMAGE_TAG}
 
-      - echo "AWS_ACCOUNT_ID=${AWS_ACCOUNT_ID}"
-      - echo "REPOSITORY_URI=${REPOSITORY_URI}"
       - echo "IMAGE_TAG=${IMAGE_TAG}"
+      - echo "LOCAL_IMAGE=${LOCAL_IMAGE}"
+      - echo "ECR_IMAGE=${ECR_IMAGE}"
 
-      - echo "===== Login to Amazon ECR ====="
-      - aws ecr --region ${AWS_REGION_NAME} get-login-password | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION_NAME}.amazonaws.com
+      # Trivy 설치
+      - TRIVY_VERSION=0.19.2
+      - rpm -ivh https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.rpm
+
+      # Dockle 설치
+      - DOCKLE_VERSION=0.3.15
+      - rpm -ivh https://github.com/goodwithtech/dockle/releases/download/v${DOCKLE_VERSION}/dockle_${DOCKLE_VERSION}_Linux-64bit.rpm
 
   build:
     commands:
-      - echo "===== Docker Build Start ====="
-      - docker image build -t ${REPOSITORY_URI}:${IMAGE_TAG} .
+      - echo "Building Docker image ${LOCAL_IMAGE}..."
+      - docker image build -t ${LOCAL_IMAGE} .
 
   post_build:
     commands:
-      - echo "===== Docker Push Start ====="
-      - docker image push ${REPOSITORY_URI}:${IMAGE_TAG}
+      - echo "Scanning image with Trivy (save results)..."
+      - trivy --no-progress -f json -o trivy_results.json --exit-code 0 ${LOCAL_IMAGE}
 
-      - echo "===== Create imagedefinitions.json ====="
-      - printf '[{"name":"%s","imageUri":"%s"}]' "${ECS_CONTAINER_NAME}" "${REPOSITORY_URI}:${IMAGE_TAG}" > imagedefinitions.json
+      - echo "Scanning image with Trivy (fail on CRITICAL)..."
+      - trivy --no-progress --exit-code 1 --severity CRITICAL ${LOCAL_IMAGE}
 
-      - echo "===== Check imagedefinitions.json ====="
-      - cat imagedefinitions.json
+      - echo "Saving local image to tar for Dockle..."
+      - docker save ${LOCAL_IMAGE} -o sbcntr-backend.tar
+
+      - echo "Scanning image with Dockle (from tar)..."
+      - dockle --input sbcntr-backend.tar \
+        --format json -o dockle_results.json \
+        --exit-code 1 --exit-level "FATAL"
+
+      - echo "Tagging image for ECR and pushing..."
+      - docker tag ${LOCAL_IMAGE} ${ECR_IMAGE}
+      - docker image push ${ECR_IMAGE}
+
+      - echo "Writing imagedefinitions.json for ECS deployment..."
+      - printf '[{"name":"%s","imageUri":"%s"}]' "${ECR_REPOSITORY_NAME}" "${ECR_IMAGE}" > imagedefinitions.json
 
 artifacts:
   files:
     - imagedefinitions.json
+    - trivy_results.json
+    - dockle_results.json
